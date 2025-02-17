@@ -1,3 +1,4 @@
+
 package main
 
 import (
@@ -8,7 +9,10 @@ import (
 	"sync"
 	"sort"
 	"strconv"
+
 	"github.com/gorilla/mux"
+	"github.com/rs/cors"
+
 )
 
 // Struct to represent OHLCV data from Binance API
@@ -43,12 +47,24 @@ func main() {
 	// Define routes
 	router.HandleFunc("/ohlcv", getOHLCVData).Methods("GET")
 
+	// Add CORS middleware
+    c := cors.New(cors.Options{
+        AllowedOrigins:   []string{"http://104.199.197.142:3000"}, // Allow your frontend origin
+        AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+        AllowedHeaders:   []string{"Content-Type", "Authorization"},
+        AllowCredentials: true,
+    })
+
+    // Wrap the router with the CORS middleware
+    handler := c.Handler(router)
+
+
 	// Start the server
 	log.Println("Server started on :8080")
-	log.Fatal(http.ListenAndServe(":8080", router))
+	log.Fatal(http.ListenAndServe(":8080", handler))
 }
 
-// Handler to fetch OHLCV data for top 50 coins by market cap (trading volume) from Binance API
+// Handler to fetch OHLCV data for top 50 coins by trading volume from Binance API
 func getOHLCVData(w http.ResponseWriter, r *http.Request) {
 	// Fetch 24-hour ticker data for all USDT pairs
 	tickerData, err := fetch24hTickerData()
@@ -62,7 +78,11 @@ func getOHLCVData(w http.ResponseWriter, r *http.Request) {
 
 	// Use a WaitGroup to wait for all goroutines to finish
 	var wg sync.WaitGroup
+	
+	// Reset data safely using mutex
+	mu.Lock()
 	ohlcvData = make([]OHLCVData, 0)
+	mu.Unlock()
 
 	// Loop through each trading pair and fetch OHLCV data
 	for _, symbol := range top50Symbols {
@@ -76,6 +96,17 @@ func getOHLCVData(w http.ResponseWriter, r *http.Request) {
 	// Wait for all goroutines to finish
 	wg.Wait()
 
+	// Log data before sending response
+	mu.Lock()
+	log.Printf("Sending %d records to frontend\n", len(ohlcvData))
+	for i, data := range ohlcvData {
+		log.Printf("Symbol: %s, Open: %s, Close: %s", data.Symbol, data.Open, data.Close)
+		if i >= 4 { // Limit log output to first 5 items
+			break
+		}
+	}
+	mu.Unlock()
+
 	// Send the OHLCV data as JSON response
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ohlcvData)
@@ -87,18 +118,21 @@ func fetch24hTickerData() ([]TickerData, error) {
 
 	response, err := http.Get(url)
 	if err != nil {
+		log.Println("Failed to fetch ticker data:", err)
 		return nil, err
 	}
 	defer response.Body.Close()
 
 	body, err := ioutil.ReadAll(response.Body)
 	if err != nil {
+		log.Println("Failed to read ticker data response:", err)
 		return nil, err
 	}
 
 	var tickerData []TickerData
 	err = json.Unmarshal(body, &tickerData)
 	if err != nil {
+		log.Println("Failed to parse ticker data JSON:", err)
 		return nil, err
 	}
 
@@ -151,6 +185,9 @@ func fetchOHLCVForSymbol(symbol string) {
 		return
 	}
 
+	// Log the raw JSON response to debug malformed data
+	log.Printf("Raw OHLCV response for %s: %s\n", symbol, string(body))
+
 	var rawData [][]interface{}
 	err = json.Unmarshal(body, &rawData)
 	if err != nil {
@@ -160,6 +197,12 @@ func fetchOHLCVForSymbol(symbol string) {
 
 	// Convert the raw data into OHLCVData struct
 	for _, data := range rawData {
+		// Ensure that data has at least 11 elements
+		if len(data) < 11 {
+			log.Printf("Skipping invalid OHLCV data for %s: %+v\n", symbol, data)
+			continue
+		}
+
 		ohlcv := OHLCVData{
 			Symbol:                   symbol,
 			OpenTime:                 int64(data[0].(float64)),
